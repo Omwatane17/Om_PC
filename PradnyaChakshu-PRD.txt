@@ -1,0 +1,161 @@
+
+HACKATHON PRD  ·  [UNBIASED AI DECISION] TRACK
+PradnyaChakshu 
+AI Bias Detection & Fairness Auditing Platform
+Real-time bias detection for automated decision systems — built to protect people from invisible discrimination at scale.
+Field	Detail
+Version	1.0 — Hackathon MVP
+Track	[Unbiased AI Decision] — Ensuring Fairness and Detecting Bias
+Stage	Prototype · 24–48 Hour Build
+Domains	Hiring · Lending · Healthcare · Criminal Justice
+Author	PradnyaChakshu  Team
+ 
+01
+Problem Statement
+WHY THIS MATTERS
+
+Automated AI decisions now affect billions of people in hiring, credit, healthcare, and criminal justice — yet most systems have no mechanism to detect or correct the bias they perpetuate.
+
+AI models trained on historical data inherit historical prejudices. When those models make or influence decisions about human lives — loan approvals, job screenings, medical diagnoses, parole hearings — biased outputs cause real, measurable harm to marginalized communities.
+The problem is invisible by design: decision-makers trust the model, don't understand its internals, and have no tools to audit outputs for demographic disparities in real time.
+Existing solutions are either expensive enterprise tools (inaccessible to startups/NGOs) or academic libraries requiring deep ML expertise — leaving a massive gap for accessible, actionable bias detection.
+
+Affected Domains
+Domain	The Bias Problem	Scale
+Hiring	Resume screening models reject women and minorities at disproportionate rates. Amazon shut theirs down; most companies haven't.	73% of companies use AI in hiring with no bias audit
+Lending	Credit scoring algorithms deny loans to Black applicants at 2.7x the rate of equivalent White applicants (CFPB, 2023).	$4.2B in AI discrimination lawsuits since 2020
+Healthcare	Pulse oximeters, risk scoring tools, and diagnostic AI routinely underperform for darker-skinned patients with documented patient harm.	12+ new AI fairness regulations passed in 2024
+Criminal Justice	Recidivism prediction tools (e.g. COMPAS) score Black defendants as high-risk at double the rate of White defendants.	0 accessible real-time bias dashboards for SMEs
+ 
+02
+Solution Overview
+THE PRODUCT
+
+PradnyaChakshu  is a plug-and-play bias auditing platform that connects to any AI decision pipeline, continuously monitors outputs for demographic disparities, and surfaces explainable, actionable fairness reports — in minutes, not months.
+
+How It Works — 5-Step Pipeline
+Step	Action	Details
+1. Ingest	Upload or Connect	Upload CSV/JSON or connect live API endpoint / database
+2. Profile	Auto-Detect Attributes	Automatically flags sensitive attributes: gender, race, age, ZIP code, name
+3. Audit	Run Fairness Metrics	Compute 10+ fairness metrics across all demographic slices simultaneously
+4. Explain	AI-Powered Explanations	SHAP attribution + Claude LLM generates plain-English causal explanations of bias
+5. Report	Compliance Report	One-click PDF report formatted for EU AI Act, EEOC, and CFPB submission
+
+Key Differentiators
+Differentiator	Description
+Zero ML Expertise Required	Upload a CSV, get a bias report — no code, no data science degree needed
+Plain-English AI Explanations	LLM explains WHY bias exists and suggests specific, actionable remediation steps
+Regulation-Ready Reports	Auto-formatted for EU AI Act Article 9, EEOC Uniform Guidelines, CFPB fair lending
+Real-Time Monitoring	Continuous drift detection — alerts when bias increases beyond threshold in production
+Open-Source Fairness Core	Transparent methodology using Fairlearn + AIF360 — not a black box auditing a black box
+
+Target Users
+•	HR / Recruitment Teams — Audit resume screening and interview scoring tools before deployment
+•	Fintech / Lending Companies — Meet CFPB and EU AI Act fairness requirements continuously
+•	Healthcare Systems — Monitor diagnostic AI for performance gaps across patient demographics
+•	NGOs & Policy Advocates — Investigate public-sector AI systems for civil rights violations
+•	ML Engineers — Integrate bias monitoring into existing model deployment pipelines
+ 
+03
+Core Features & Modules
+PRODUCT FEATURES
+
+Module 1 — Data Ingestion
+Upload CSV/JSON datasets or connect to APIs. Auto-detect column types and flag sensitive attributes (gender, race, age, ZIP code, name, etc.) using heuristics and LLM classification. Preview data summary with demographic distribution charts before analysis begins.
+Module 2 — Fairness Engine
+Compute 10+ industry-standard fairness metrics in parallel: Demographic Parity, Equalized Odds, Predictive Parity, Individual Fairness, Counterfactual Fairness, Calibration, and more. Slice analysis across all demographic intersections simultaneously.
+Module 3 — AI Explainer
+SHAP-powered feature attribution shows which input features drive biased outputs. Claude AI generates plain-English explanations: "Your model denies loans to ZIP codes 60601–60620 at 3x the rate of others — this correlates strongly with historically redlined neighborhoods."
+Module 4 — Interactive Dashboard
+Visual bias heatmaps across demographic groups. Disparity ratio charts. Trend lines for model drift over time. Drill-down into individual flagged decisions with counterfactual explanations: "This person would have been approved if their ZIP code were 10001."
+Module 5 — Compliance Reporter
+One-click export of structured bias audit reports. Templates aligned with EU AI Act Article 9, EEOC Uniform Guidelines, and CFPB fair lending standards. Includes risk score, severity rating, and required remediation actions with timelines.
+Module 6 — Live Monitor
+Webhook integration to monitor production model outputs in real time. Statistical drift detection alerts when fairness metrics degrade beyond configurable thresholds. Slack/email notifications with daily fairness score summaries.
+
+Fairness Metrics Computed
+[Demographic Parity]  [Equalized Odds]  [Equal Opportunity]  [Predictive Parity]
+[Calibration]  [Individual Fairness]  [Counterfactual Fairness]  [Disparate Impact Ratio]
+[4/5ths Rule (EEOC)]  [Treatment Equality]  [Balance for Positive/Negative Class]  [Intersectional Analysis]
+ 
+04
+Technical Architecture
+HOW IT'S BUILT
+
+Frontend Stack
+Layer	Technology	Purpose
+Framework	React + TypeScript	Component-based UI with full type safety
+Styling	Tailwind CSS + shadcn/ui	Utility-first styling with accessible components
+Charts	Recharts + D3.js	Standard charts + custom heatmaps and SHAP plots
+File Upload	react-dropzone + Papaparse	Drag-and-drop CSV upload with client-side parsing
+State Management	Zustand	Lightweight global state for audit sessions
+
+Backend Stack
+Layer	Technology	Purpose
+API	FastAPI (Python)	High-performance async REST API
+Fairness Metrics	Fairlearn + AIF360 + custom	Industry-standard open-source fairness libraries
+Explainability	SHAP + LIME	Feature attribution and local model explanations
+LLM Explanations	Claude 3 Sonnet API	Plain-English bias cause narration and remediation
+Data Processing	pandas + scikit-learn	Data manipulation and ML model interface
+Storage	SQLite → PostgreSQL	Lightweight for hackathon; PostgreSQL for production
+Job Queue	Celery + Redis	Async processing for large datasets and parallel metrics
+
+Data Flow — End to End
+•	User uploads CSV or points to API endpoint; files streamed for large datasets
+•	Sensitive Attribute Detector runs using regex + embedding similarity + Claude classification
+•	Fairness metrics computed in parallel via Celery workers (one worker per metric family)
+•	SHAP values computed on representative sample; feature attribution per demographic group
+•	Claude 3 Sonnet generates natural language causal report from structured metric outputs
+•	Dashboard renders via WebSocket stream; PDF compliance report generated on demand
+Hackathon Shortcut: Use the pre-loaded UCI Adult Income dataset + a pre-trained logistic regression classifier. Focus demo time on the dashboard and LLM explanation — that is the WOW moment for judges.
+ 
+05
+User Stories & Requirements
+REQUIREMENTS
+
+ID	User Story	Acceptance Criteria	Priority
+US-01	As an HR manager, I want to upload our candidate scoring CSV and immediately see which demographic groups are being approved/rejected at different rates.	CSV upload works for files up to 10MB; demographic parity chart renders within 10 seconds; groups ranked by disparity ratio	P0 · MVP
+US-02	As a non-technical user, I want a plain-English explanation of WHY my model is biased, not just that it is.	LLM generates 3+ specific causal hypotheses with feature importance scores; explanation readable by non-data-scientist	P0 · MVP
+US-03	As a compliance officer, I want a downloadable audit report I can submit to regulators.	PDF export includes org name, date, metrics table, risk rating, and recommended mitigations	P0 · MVP
+US-04	As a data scientist, I want to see SHAP feature importance broken down by demographic group.	SHAP charts per group; toggle protected attributes; export SHAP values as CSV	P1
+US-05	As a lending company, I want to check my loan model against CFPB's 4/5ths rule and get a pass/fail.	4/5ths rule computed for all protected classes; clear PASS/FAIL badge; violating group highlighted	P1
+US-06	As an ML engineer, I want to connect my production model API to monitor outputs in real time.	Webhook accepts POST with prediction payload; bias score per 100 decisions; alert if disparity > threshold	P2
+US-07	As a judge reviewing this demo, I want to immediately understand what problem it solves within 30 seconds.	Landing page hero has one-sentence value prop; demo dataset pre-loaded; full demo takes < 2 minutes	P0 · Critical
+ 
+06
+Hackathon Roadmap — 48 Hours
+BUILD PLAN
+
+Split into 3 parallel tracks: Backend/ML · Frontend · Pitch & Demo Prep. Never let the deck wait until hour 46.
+
+Phase	Hours	Tasks
+Foundation Sprint	Hour 0–4	Repo setup, FastAPI skeleton, React app scaffold. Load UCI Adult Income dataset. Train baseline logistic regression. Compute demographic parity and disparate impact ratio. Render first chart in frontend.
+Core Feature Build	Hour 4–12	Implement all 6 fairness metrics (Fairlearn + custom). Add SHAP explainability module. Build CSV upload with sensitive attribute detector. Connect Claude API for LLM explanations. Build dashboard layout with bias heatmap.
+Polish & Integration	Hour 12–24	PDF compliance report generation. Counterfactual explanation for individual decisions. End-to-end integration test. Load 2nd demo dataset (lending) to show versatility. Write first pitch draft.
+Hardening & UI	Hour 24–36	Error handling and loading states. UI polish — typography, spacing, color consistency. Mobile-responsive layout. Record backup demo video in case live demo breaks. Finalize pitch deck (8 slides max).
+Demo Prep & Submit	Hour 36–48	Rehearse demo 5 times — target 3-minute live demo. Deploy to Railway/Render/Vercel for stable URL. Prepare 'what we'd build next' roadmap slide. Submit prototype. Practice Q&A responses. Sleep 4 hours.
+ 
+07
+Success Metrics & Judge Alignment
+WINNING CRITERIA
+
+Judge Scoring Criteria Alignment
+Criterion	PradnyaChakshu  Angle
+Problem Clarity	AI bias is a universally understood, emotionally resonant issue — zero explanation needed before judges care
+Innovation	LLM-generated causal explanations of bias is novel — no existing tool makes this accessible to non-technical users
+Technical Depth	SHAP + 10+ fairness metrics + real-time monitoring via Celery/Redis = credible and impressive ML stack
+Demo Quality	Pre-load hiring dataset, show biased output, show PradnyaChakshu  detecting it, generate report in 3 minutes — zero dead time
+Market Impact	$14B+ AI governance market; EU AI Act compliance is mandatory by August 2026 — real urgency, real TAM
+Completeness	Upload → audit → explain → report → download is a complete, shippable user workflow
+
+Product KPIs
+Metric	Target
+Time to first audit	< 3 minutes from CSV upload to full dashboard
+Fairness metrics coverage	10+ metrics computed per audit
+Report generation time	< 30 seconds for PDF compliance report
+Non-technical comprehension rate	>= 80% of users understand results without explanation
+Regulation templates (MVP)	3 templates: EU AI Act, EEOC, CFPB
+Demo run time	< 3 minutes end-to-end for live pitch demo
+
+The 30-Second Pitch: "Every day, AI systems reject loan applications, screen out job candidates, and influence medical care — often with built-in bias no one can see. PradnyaChakshu  is the smoke detector for AI discrimination: upload your model's outputs, get a complete fairness audit in under 3 minutes, and a plain-English report you can actually act on."
+

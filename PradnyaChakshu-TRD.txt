@@ -1,0 +1,952 @@
+
+TECHNICAL REQUIREMENTS DOCUMENT
+PradnyaChakshu 
+AI Bias Detection & Fairness Auditing Platform
+This document defines the full technical architecture, system design, API contracts, data schemas, algorithm specifications, security requirements, and deployment strategy for the PradnyaChakshu  platform.
+Attribute	Value
+Document Type	Technical Requirements Document (TRD)
+Version	1.0 — Hackathon Edition
+Product	PradnyaChakshu  — AI Bias Detection Platform
+Track	[Unbiased AI Decision] Hackathon
+Date	March 2026
+Status	APPROVED FOR BUILD
+Authors	PradnyaChakshu  Engineering Team
+Related Docs	PradnyaChakshu  PRD v1.0
+ 
+Table of Contents
+
+Section	Title	Page
+1	System Overview & Architecture	3
+2	Technology Stack	4
+3	System Architecture Deep Dive	5
+4	API Specification	7
+5	Database Schema	10
+6	Core Algorithms & ML Modules	13
+7	LLM Integration (Claude API)	16
+8	Frontend Architecture	18
+9	Security & Privacy Requirements	20
+10	Infrastructure & Deployment	22
+11	Performance Requirements	24
+12	Testing Strategy	25
+13	Error Handling & Logging	27
+14	Configuration & Environment	28
+ 
+01
+SYSTEM OVERVIEW
+System Overview & Architecture
+
+1.1 Purpose
+PradnyaChakshu  is a multi-tier web application that ingests decision datasets, computes statistical fairness metrics, generates explainability artefacts via SHAP analysis, and synthesises plain-English bias narratives using Claude 3 Sonnet. The system is designed to be stateless and horizontally scalable, with all long-running analysis tasks handled asynchronously via a distributed task queue.
+
+1.2 High-Level Architecture
+The system follows a three-tier architecture with an additional async processing layer:
+
+Tier	Components	Responsibility
+Presentation	React SPA (TypeScript)	User interface, file upload, dashboard rendering, report download
+API Gateway	FastAPI (Python 3.11)	REST endpoints, request validation, auth, WebSocket channels
+Task Queue	Celery + Redis	Async execution of fairness analysis, SHAP computation, LLM calls
+ML Engine	scikit-learn, Fairlearn, AIF360, SHAP	Metric computation, model wrapping, feature attribution
+LLM Layer	Anthropic Claude 3 Sonnet API	Natural language explanations, remediation suggestions
+Data Store	PostgreSQL + Redis	Persistent audit records, task state, session caching
+Object Store	Local FS → S3-compatible	Uploaded datasets, generated PDF reports
+
+1.3 Architectural Principles
+•	Separation of Concerns: ML computation is fully decoupled from API layer via Celery
+•	Fail-Safe Design: Fairness engine errors degrade gracefully; partial results are returned with warnings
+•	Privacy by Design: Uploaded data is never persisted beyond session TTL (24 hours default)
+•	Idempotency: All audit jobs are idempotent; re-running same dataset produces identical results
+•	Observability: Structured JSON logging at every layer; Prometheus metrics exposed on /metrics
+ 
+02
+TECHNOLOGY STACK
+Technology Stack
+
+2.1 Backend
+Package	Version	Purpose	License
+Python	3.11.x	Primary backend runtime	PSF
+FastAPI	0.111.x	Async REST API framework	MIT
+Uvicorn	0.30.x	ASGI server (production: gunicorn+uvicorn workers)	BSD
+Celery	5.4.x	Distributed task queue for async ML jobs	BSD
+Redis	7.2.x	Message broker, result backend, session cache	BSD
+SQLAlchemy	2.0.x	ORM, connection pooling	MIT
+Alembic	1.13.x	Database migrations	MIT
+PostgreSQL	16.x	Primary relational database	PostgreSQL
+pandas	2.2.x	Tabular data ingestion and manipulation	BSD
+scikit-learn	1.5.x	ML utilities, model wrappers, preprocessing	BSD
+Fairlearn	0.10.x	Microsoft fairness metrics library	MIT
+aif360	0.6.x	IBM AI Fairness 360 metrics	Apache 2.0
+shap	0.45.x	SHAP explainability (TreeExplainer, KernelExplainer)	MIT
+anthropic	0.28.x	Official Claude API Python SDK	MIT
+pydantic	2.7.x	Request/response schema validation	MIT
+python-jose	3.3.x	JWT token creation/validation	MIT
+reportlab	4.2.x	PDF report generation	BSD
+pytest	8.x	Test framework	MIT
+
+2.2 Frontend
+Package	Version	Purpose
+React	18.3.x	UI component framework
+TypeScript	5.4.x	Static typing
+Vite	5.x	Build tool and dev server
+Tailwind CSS	3.4.x	Utility-first styling
+shadcn/ui	latest	Accessible component primitives (Radix UI based)
+Recharts	2.12.x	Chart components (bar, line, radar)
+D3.js	7.9.x	Custom heatmap and SHAP beeswarm plots
+Zustand	4.5.x	Global state management
+react-dropzone	14.x	Drag-and-drop file upload
+Papaparse	5.4.x	Client-side CSV parsing and preview
+axios	1.7.x	HTTP client with interceptors
+socket.io-client	4.7.x	WebSocket connection for live progress
+react-pdf	7.x	In-browser PDF preview
+vitest	1.x	Frontend unit testing
+Playwright	1.44.x	End-to-end browser testing
+
+2.3 Infrastructure
+Tool	Purpose
+Docker + Docker Compose	Containerisation of all services for local dev and production
+Nginx	Reverse proxy, SSL termination, static file serving
+Railway / Render	Hackathon PaaS deployment target
+GitHub Actions	CI/CD pipeline (lint → test → build → deploy)
+Sentry	Error tracking and performance monitoring
+Prometheus + Grafana	Metrics and alerting (post-hackathon)
+ 
+03
+ARCHITECTURE DEEP DIVE
+System Architecture Deep Dive
+
+3.1 Request Lifecycle
+1.	Client uploads CSV via multipart/form-data POST to /api/v1/audits
+2.	FastAPI validates file (size, MIME type, row count). Returns 400 on violation.
+3.	File is written to ephemeral object store (UUID-namespaced path).
+4.	A Celery task chain is enqueued: [detect_attributes | compute_metrics | run_shap | call_llm | generate_pdf]
+5.	API returns 202 Accepted with { audit_id, websocket_channel }
+6.	Client subscribes to WebSocket channel. Each Celery task emits progress events.
+7.	On completion, final audit result is stored in PostgreSQL and client receives DONE event.
+8.	Client fetches full result via GET /api/v1/audits/{audit_id}
+
+3.2 Celery Task Chain
+Tasks are chained using Celery's chord/chain primitives. Each task is independently retryable:
+
+# tasks/audit_chain.py
+from celery import chain, chord
+ 
+def create_audit_chain(audit_id: str, file_path: str):
+    return chain(
+        detect_sensitive_attributes.s(audit_id, file_path),
+        compute_fairness_metrics.s(),
+        chord(
+            [run_shap_analysis.s(), compute_counterfactuals.s()],
+            aggregate_explanations.s()
+        ),
+        call_llm_explainer.s(),
+        generate_pdf_report.s(),
+    ).apply_async()
+
+3.3 WebSocket Event Schema
+All WebSocket messages follow a typed envelope:
+
+// TypeScript types (shared between client and server via openapi-typescript)
+interface WSEvent {
+  audit_id:  string;
+  event:     'progress' | 'partial_result' | 'done' | 'error';
+  stage:     'detect' | 'metrics' | 'shap' | 'llm' | 'pdf';
+  pct:       number;          // 0–100
+  message:   string;
+  payload?:  Partial<AuditResult>;
+}
+
+3.4 Data Isolation Model
+Each audit session is fully isolated:
+•	Uploaded files are stored under /tmp/PradnyaChakshu /{audit_id}/ and deleted after 24 hours via a cron job.
+•	PostgreSQL rows are partitioned by organisation_id (UUID v4 per registration).
+•	Redis keys are namespaced as PradnyaChakshu :{org_id}:{audit_id}:{key}.
+•	No cross-tenant data leakage is possible; foreign-key constraints enforce org boundaries.
+ 
+04
+API SPECIFICATION
+API Specification
+
+Base URL: https://api.PradnyaChakshu .io/api/v1  |  Auth: Bearer JWT (HS256)  |  Content-Type: application/json
+
+4.1 Authentication Endpoints
+Method	Path	Description	Auth
+POST	/auth/register	Create new organisation account	None
+POST	/auth/login	Exchange credentials for JWT access+refresh tokens	None
+POST	/auth/refresh	Rotate access token using refresh token	Refresh JWT
+POST	/auth/logout	Invalidate refresh token	Bearer JWT
+
+4.2 Audit Endpoints
+Method	Path	Description	Auth
+POST	/audits	Create new audit job (multipart/form-data, CSV upload)	Bearer JWT
+GET	/audits	List all audits for the authenticated organisation	Bearer JWT
+GET	/audits/{audit_id}	Retrieve full audit result (blocks until complete)	Bearer JWT
+GET	/audits/{audit_id}/status	Poll audit progress (stage, pct_complete)	Bearer JWT
+GET	/audits/{audit_id}/report	Download PDF compliance report (binary)	Bearer JWT
+GET	/audits/{audit_id}/shap	Retrieve SHAP values as JSON	Bearer JWT
+DELETE	/audits/{audit_id}	Delete audit record and associated files	Bearer JWT
+
+POST /audits — Request Schema
+# multipart/form-data fields:
+file:             File          # CSV or JSON, max 50 MB
+label_column:     str           # Name of the outcome/decision column
+score_column:     str | null    # Probability score column (optional)
+protected_attrs:  str[]         # Explicit protected attribute columns (optional)
+                                # If omitted, auto-detected
+model_type:       str           # 'classification' | 'regression' | 'ranking'
+regulation:       str           # 'eu_ai_act' | 'eeoc' | 'cfpb' | 'generic'
+org_context:      str | null    # Free-text: 'hiring model for software engineers'
+
+GET /audits/{audit_id} — Response Schema
+{
+  audit_id:          string,
+  created_at:        ISO8601,
+  status:            'pending' | 'running' | 'complete' | 'failed',
+  dataset_summary: {
+    row_count:       int,
+    column_count:    int,
+    label_column:    string,
+    protected_attrs: string[],
+    class_balance:   Record<string, number>,
+  },
+  fairness_metrics: {
+    [metric_name: string]: {
+      overall:       number,
+      by_group:      Record<string, number>,
+      disparity_ratio: number,
+      pass_fail:     'PASS' | 'FAIL' | 'WARNING',
+      threshold:     number,
+    }
+  },
+  shap_summary: {
+    top_features:    FeatureImportance[],
+    by_group:        Record<string, FeatureImportance[]>,
+    beeswarm_data:   ShapPoint[],
+  },
+  llm_explanation: {
+    executive_summary:     string,
+    causal_hypotheses:     CausalHypothesis[],
+    remediation_steps:     RemediationStep[],
+    regulation_compliance: RegulationSummary,
+  },
+  risk_score:        number,   // 0–100
+  risk_level:        'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL',
+  report_url:        string | null,
+}
+
+4.3 Monitoring Endpoints
+Method	Path	Description
+POST	/monitors	Register a production model webhook for live monitoring
+GET	/monitors	List all active monitors for the organisation
+POST	/monitors/{id}/ingest	Ingest a batch of live predictions (max 1000 rows/batch)
+GET	/monitors/{id}/drift	Retrieve fairness drift timeseries for the monitor
+PUT	/monitors/{id}/thresholds	Update alert thresholds for a monitor
+DELETE	/monitors/{id}	Deactivate a monitor
+
+4.4 Error Response Schema
+{
+  error: {
+    code:    string,   // e.g. 'INVALID_FILE_FORMAT', 'INSUFFICIENT_DATA'
+    message: string,   // Human-readable description
+    detail:  object,   // Optional machine-readable detail
+    trace_id: string,  // Sentry/logging correlation ID
+  }
+}
+
+HTTP Status	Error Code	Trigger Condition
+400	INVALID_FILE_FORMAT	Uploaded file is not valid CSV/JSON
+400	INSUFFICIENT_DATA	Dataset has fewer than 50 rows
+400	MISSING_LABEL_COLUMN	label_column not found in dataset
+400	NO_PROTECTED_ATTRS	Auto-detection found zero protected attributes
+401	INVALID_TOKEN	JWT is missing, malformed, or expired
+403	FORBIDDEN	Audit belongs to a different organisation
+413	FILE_TOO_LARGE	Uploaded file exceeds 50 MB limit
+422	VALIDATION_ERROR	Pydantic schema validation failure
+429	RATE_LIMITED	Too many requests (100/hour per org)
+500	ANALYSIS_FAILED	Unrecoverable error in fairness engine
+503	QUEUE_UNAVAILABLE	Celery broker (Redis) unreachable
+ 
+05
+DATABASE SCHEMA
+Database Schema
+
+5.1 Entity Relationship Overview
+PostgreSQL 16. All tables use UUID primary keys. Timestamps are stored as TIMESTAMPTZ (UTC). Sensitive columns are encrypted at-rest using pgcrypto AES-256.
+
+Table	Primary Key	Description
+organisations	org_id (UUID)	Tenant/team accounts
+users	user_id (UUID)	Individual user accounts within an org
+api_keys	key_id (UUID)	API key records for programmatic access
+audits	audit_id (UUID)	Core audit job records
+audit_metrics	metric_id (UUID)	Per-metric results for each audit
+audit_shap	shap_id (UUID)	SHAP feature attribution blobs per audit
+audit_llm	llm_id (UUID)	LLM explanation records per audit
+monitors	monitor_id (UUID)	Live production model monitors
+monitor_snapshots	snap_id (UUID)	Time-series fairness snapshots per monitor
+reports	report_id (UUID)	Generated PDF report metadata
+
+5.2 Core Table Definitions
+organisations
+CREATE TABLE organisations (
+  org_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name            VARCHAR(255) NOT NULL,
+  plan            VARCHAR(50)  NOT NULL DEFAULT 'free',
+  created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  metadata        JSONB        NOT NULL DEFAULT '{}'
+);
+
+users
+CREATE TABLE users (
+  user_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  org_id          UUID         NOT NULL REFERENCES organisations(org_id) ON DELETE CASCADE,
+  email           VARCHAR(320) NOT NULL UNIQUE,
+  password_hash   TEXT         NOT NULL,  -- bcrypt, cost=12
+  role            VARCHAR(50)  NOT NULL DEFAULT 'analyst',
+  is_active       BOOLEAN      NOT NULL DEFAULT true,
+  created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  last_login_at   TIMESTAMPTZ
+);
+CREATE INDEX idx_users_org_id ON users(org_id);
+
+audits
+CREATE TABLE audits (
+  audit_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  org_id            UUID         NOT NULL REFERENCES organisations(org_id),
+  user_id           UUID         NOT NULL REFERENCES users(user_id),
+  status            VARCHAR(20)  NOT NULL DEFAULT 'pending',
+    -- CHECK (status IN ('pending','running','complete','failed'))
+  model_type        VARCHAR(30)  NOT NULL,
+  regulation        VARCHAR(30)  NOT NULL DEFAULT 'generic',
+  label_column      VARCHAR(255) NOT NULL,
+  score_column      VARCHAR(255),
+  protected_attrs   TEXT[]       NOT NULL DEFAULT '{}',
+  row_count         INTEGER,
+  col_count         INTEGER,
+  file_path         TEXT,        -- ephemeral; NULL after 24h cleanup
+  risk_score        NUMERIC(5,2),
+  risk_level        VARCHAR(10),
+  error_message     TEXT,
+  celery_task_id    VARCHAR(255),
+  org_context       TEXT,
+  created_at        TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  completed_at      TIMESTAMPTZ
+);
+CREATE INDEX idx_audits_org_id     ON audits(org_id);
+CREATE INDEX idx_audits_status     ON audits(status);
+CREATE INDEX idx_audits_created_at ON audits(created_at DESC);
+
+audit_metrics
+CREATE TABLE audit_metrics (
+  metric_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  audit_id          UUID         NOT NULL REFERENCES audits(audit_id) ON DELETE CASCADE,
+  metric_name       VARCHAR(100) NOT NULL,
+    -- e.g. 'demographic_parity_difference', 'equalized_odds_difference'
+  protected_attr    VARCHAR(255) NOT NULL,
+  overall_value     NUMERIC(10,6) NOT NULL,
+  disparity_ratio   NUMERIC(10,6),
+  pass_fail         VARCHAR(10)  NOT NULL,
+  threshold         NUMERIC(10,6) NOT NULL,
+  by_group          JSONB        NOT NULL DEFAULT '{}',
+    -- { 'Male': 0.82, 'Female': 0.61 }
+  computed_at       TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_metrics_audit_id ON audit_metrics(audit_id);
+
+audit_llm
+CREATE TABLE audit_llm (
+  llm_id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  audit_id            UUID  NOT NULL REFERENCES audits(audit_id) ON DELETE CASCADE,
+  executive_summary   TEXT  NOT NULL,
+  causal_hypotheses   JSONB NOT NULL DEFAULT '[]',
+  remediation_steps   JSONB NOT NULL DEFAULT '[]',
+  regulation_summary  JSONB NOT NULL DEFAULT '{}',
+  model_used          VARCHAR(100) NOT NULL,
+  prompt_tokens       INTEGER,
+  completion_tokens   INTEGER,
+  latency_ms          INTEGER,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX idx_llm_audit_id ON audit_llm(audit_id);
+
+monitor_snapshots
+CREATE TABLE monitor_snapshots (
+  snap_id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  monitor_id        UUID         NOT NULL REFERENCES monitors(monitor_id),
+  snapshot_at       TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  row_count         INTEGER      NOT NULL,
+  metrics           JSONB        NOT NULL,  -- same shape as audit_metrics
+  drift_from_baseline NUMERIC(10,6),
+  alert_triggered   BOOLEAN      NOT NULL DEFAULT false
+);
+CREATE INDEX idx_snaps_monitor_id  ON monitor_snapshots(monitor_id);
+CREATE INDEX idx_snaps_snapshot_at ON monitor_snapshots(snapshot_at DESC);
+ 
+06
+CORE ALGORITHMS & ML MODULES
+Core Algorithms & ML Modules
+
+6.1 Sensitive Attribute Detector
+The detector uses a three-stage pipeline to identify protected attributes without requiring user specification:
+
+Stage	Method	Examples Detected
+1. Column Name Heuristics	Regex + keyword list match against column names (case-insensitive)	gender, sex, race, ethnicity, age, dob, zip, postcode, nationality
+2. Value Distribution Analysis	High-cardinality columns excluded; low-cardinality string/int columns flagged	Columns with 2–20 unique values in small alphabets
+3. Embedding Similarity	Column name embedded via sentence-transformers all-MiniLM-L6-v2; cosine similarity >0.75 to protected-attr seed set	Catches obfuscated names: 'demo_group', 'segm_code'
+
+6.2 Fairness Metrics Engine
+All metrics are implemented using Fairlearn 0.10 as the primary library, with custom implementations for metrics not covered. Each metric is computed per protected attribute and per intersectional group pair.
+
+Metric	Formula (simplified)	Pass Threshold	Regulation
+Demographic Parity Difference	P(ŷ=1|A=a) − P(ŷ=1|A=b)	|value| ≤ 0.10	EU AI Act
+Equalized Odds Difference	max(TPR gap, FPR gap) across groups	|value| ≤ 0.10	EEOC
+Equal Opportunity Difference	TPR(A=a) − TPR(A=b)	|value| ≤ 0.10	EEOC
+Predictive Parity Difference	PPV(A=a) − PPV(A=b)	|value| ≤ 0.10	CFPB
+Disparate Impact Ratio	P(ŷ=1|A=a) / P(ŷ=1|A=b)	≥ 0.80 (4/5 rule)	EEOC / CFPB
+Calibration Difference	|P(Y=1|ŷ=s,A=a) − P(Y=1|ŷ=s,A=b)|	|value| ≤ 0.05	Generic
+Individual Fairness Score	1 − avg Lipschitz violation over sampled pairs	≥ 0.90	EU AI Act
+Counterfactual Fairness Score	P(ŷ_CF=1) vs P(ŷ=1) after attr flip	Ratio in [0.9, 1.1]	EU AI Act
+Balance (Positive Class)	avg score | Y=1 equal across groups	Std dev ≤ 0.05	Generic
+Balance (Negative Class)	avg score | Y=0 equal across groups	Std dev ≤ 0.05	Generic
+Treatment Equality	FN/FP ratio equal across groups	Max ratio diff ≤ 0.20	Generic
+Intersectional Disparity	Pairwise DPD across all attr combinations	|value| ≤ 0.15	EU AI Act
+
+6.3 SHAP Explainability Module
+SHAP (SHapley Additive exPlanations) is used to attribute prediction contributions to input features. The explainer type is chosen based on model type:
+
+# engine/shap_module.py
+import shap
+import numpy as np
+ 
+class PradnyaChakshu ShapExplainer:
+    def __init__(self, model, X_train, model_type='tree'):
+        if model_type == 'tree':
+            self.explainer = shap.TreeExplainer(model)
+        elif model_type == 'linear':
+            self.explainer = shap.LinearExplainer(model, X_train)
+        else:
+            # KernelExplainer for black-box models (slower)
+            self.explainer = shap.KernelExplainer(
+                model.predict_proba,
+                shap.sample(X_train, 100)  # background dataset
+            )
+ 
+    def compute(self, X_sample: pd.DataFrame) -> dict:
+        shap_values = self.explainer.shap_values(X_sample)
+        return {
+            'values': shap_values.tolist(),
+            'base_value': float(self.explainer.expected_value),
+            'feature_names': X_sample.columns.tolist(),
+            'data': X_sample.values.tolist()
+        }
+ 
+    def by_group(self, X: pd.DataFrame, group_col: str) -> dict:
+        results = {}
+        for group, subset in X.groupby(group_col):
+            results[str(group)] = self.compute(subset.drop(columns=[group_col]))
+        return results
+
+6.4 Counterfactual Generator
+For individual decision explanations, PradnyaChakshu  generates counterfactual examples by flipping the value of each protected attribute and re-scoring the model. This surfaces statements like: "This applicant would have been approved if their gender were Male."
+
+# engine/counterfactual.py
+def generate_counterfactuals(model, row: pd.Series,
+                              protected_attrs: list[str]) -> list[dict]:
+    results = []
+    original_pred = model.predict_proba([row])[0][1]
+    for attr in protected_attrs:
+        unique_vals = row[attr + '_candidates']  # pre-computed from dataset
+        for alt_val in unique_vals:
+            if alt_val == row[attr]: continue
+            cf_row = row.copy()
+            cf_row[attr] = alt_val
+            cf_pred = model.predict_proba([cf_row])[0][1]
+            results.append({
+                'attribute':     attr,
+                'original_value': row[attr],
+                'counterfactual_value': alt_val,
+                'original_score':  original_pred,
+                'counterfactual_score': cf_pred,
+                'score_delta': cf_pred - original_pred,
+                'decision_changed': (
+                    round(cf_pred) != round(original_pred)
+                )
+            })
+    return sorted(results, key=lambda x: abs(x['score_delta']), reverse=True)
+
+6.5 Risk Scoring Formula
+The overall audit risk score (0–100) is a weighted composite of metric failures and disparity severities:
+
+def compute_risk_score(metrics: list[MetricResult]) -> tuple[float, str]:
+    weights = {
+        'demographic_parity_difference': 0.25,
+        'equalized_odds_difference':     0.20,
+        'disparate_impact_ratio':        0.20,
+        'equal_opportunity_difference':  0.15,
+        'predictive_parity_difference':  0.10,
+        'counterfactual_fairness_score': 0.10,
+    }
+    score = 0.0
+    for m in metrics:
+        w = weights.get(m.metric_name, 0.05)
+        # Normalise severity: 0 = at threshold, 1 = 2x threshold
+        severity = min(abs(m.overall_value) / m.threshold, 2.0) / 2.0
+        score += w * severity * 100
+    risk_level = (
+        'LOW'      if score < 20  else
+        'MEDIUM'   if score < 45  else
+        'HIGH'     if score < 70  else
+        'CRITICAL'
+    )
+    return round(score, 2), risk_level
+ 
+07
+LLM INTEGRATION
+LLM Integration (Claude API)
+
+7.1 Model & Configuration
+Parameter	Value	Rationale
+Model	claude-sonnet-4-20250514	Best balance of reasoning quality and latency for structured output
+Max Tokens	2048	Sufficient for full explanation + 5 remediation steps
+Temperature	0.2	Low temperature for consistent, factual explanations
+Top-P	0.9	Slight diversity to avoid formulaic language
+Timeout	45s	Generous; LLM is non-blocking (Celery task)
+Retry Policy	3 retries, exponential backoff (2s, 4s, 8s)	Handle transient API errors
+
+7.2 System Prompt
+SYSTEM_PROMPT = """
+You are PradnyaChakshu , an expert AI fairness auditor with deep knowledge of:
+- Statistical fairness metrics (demographic parity, equalized odds, SHAP)
+- Anti-discrimination law (EU AI Act, US EEOC, CFPB fair lending)
+- Machine learning bias causes (historical bias, measurement bias,
+  aggregation bias, representation bias)
+- Practical bias remediation techniques
+ 
+You will receive structured audit results and must produce a JSON response
+with these exact keys:
+  executive_summary     (2-3 sentences, plain English, no jargon)
+  causal_hypotheses     (array of 3-5 objects: {hypothesis, evidence,
+                         confidence: 'HIGH'|'MEDIUM'|'LOW'})
+  remediation_steps     (array of 4-6 objects: {action, priority,
+                         effort: 'LOW'|'MEDIUM'|'HIGH', expected_impact})
+  regulation_compliance ({regulation_name, status: 'PASS'|'FAIL'|'PARTIAL',
+                         key_violations: string[], recommendation})
+ 
+Rules:
+- Never use technical metric names in executive_summary
+- Cite specific numbers from the provided metrics
+- remediation_steps must be actionable by a non-ML engineer
+- Return ONLY valid JSON. No markdown, no preamble.
+"""
+
+7.3 User Prompt Template
+def build_llm_prompt(audit: AuditResult) -> str:
+    return f"""
+AUDIT CONTEXT:
+Organisation context: {audit.org_context or 'Not provided'}
+Model type: {audit.model_type}
+Regulation: {audit.regulation}
+Dataset: {audit.row_count} rows, {len(audit.protected_attrs)} protected attributes
+Protected attributes: {', '.join(audit.protected_attrs)}
+Overall risk score: {audit.risk_score}/100 ({audit.risk_level})
+ 
+FAIRNESS METRICS (top violations):
+{format_top_violations(audit.fairness_metrics, top_n=6)}
+ 
+TOP SHAP FEATURES DRIVING DISPARITY:
+{format_shap_summary(audit.shap_summary, top_n=5)}
+ 
+WORST-CASE COUNTERFACTUAL:
+{format_worst_counterfactual(audit.counterfactuals)}
+ 
+Respond with the JSON structure specified in your system prompt.
+"""
+
+7.4 Response Parsing & Fallback
+import json, re
+from anthropic import Anthropic
+ 
+client = Anthropic()  # reads ANTHROPIC_API_KEY from environment
+ 
+def call_llm_explainer(audit_result: dict) -> dict:
+    prompt = build_llm_prompt(AuditResult(**audit_result))
+    response = client.messages.create(
+        model='claude-sonnet-4-20250514',
+        max_tokens=2048,
+        temperature=0.2,
+        system=SYSTEM_PROMPT,
+        messages=[{'role': 'user', 'content': prompt}]
+    )
+    raw = response.content[0].text
+    # Strip any accidental markdown fences
+    clean = re.sub(r'```json|```', '', raw).strip()
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        # Fallback: return structured template with error flag
+        return {
+            'executive_summary': 'Explanation generation failed; see raw metrics.',
+            'causal_hypotheses': [],
+            'remediation_steps': [],
+            'regulation_compliance': {},
+            '_error': 'llm_parse_failure',
+        }
+ 
+08
+FRONTEND ARCHITECTURE
+Frontend Architecture
+
+8.1 Application Structure
+src/
+├── app/                     # Route-level components
+│   ├── dashboard/           # Audit list + organisation summary
+│   ├── audit/               # Single audit result view
+│   ├── upload/              # New audit creation wizard
+│   ├── monitor/             # Live monitoring dashboard
+│   └── auth/                # Login, register, settings
+├── components/              # Shared UI components
+│   ├── charts/              # BiasHeatmap, ShapBeeswarm, DriftLine
+│   ├── upload/              # DropZone, ColumnMapper, AttributeSelector
+│   ├── report/              # ComplianceBadge, RiskGauge, MetricCard
+│   └── ui/                  # shadcn primitives
+├── hooks/                   # useAudit, useWebSocket, useAuth
+├── store/                   # Zustand slices: auth, audit, monitor
+├── api/                     # axios client + typed API functions
+├── types/                   # Generated from OpenAPI spec
+└── lib/                     # formatters, validators, constants
+
+8.2 State Management
+Zustand is used with three top-level slices. Each slice is independently persisted to sessionStorage (access token only; never refresh token or data).
+
+Slice	State Shape	Key Actions
+authSlice	{ user, accessToken, isAuthenticated }	login(), logout(), refreshToken()
+auditSlice	{ audits[], currentAudit, isLoading, wsProgress }	uploadDataset(), fetchAudit(), subscribeToProgress()
+monitorSlice	{ monitors[], driftData, alerts[] }	createMonitor(), fetchDrift(), acknowledgeAlert()
+
+8.3 WebSocket Hook
+// hooks/useWebSocket.ts
+export function useAuditWebSocket(auditId: string) {
+  const [progress, setProgress] = useState<WSEvent | null>(null);
+  useEffect(() => {
+    const socket = io(WS_BASE_URL, {
+      auth: { token: getAccessToken() },
+      transports: ['websocket'],
+    });
+    socket.emit('subscribe', { audit_id: auditId });
+    socket.on('audit_event', (event: WSEvent) => {
+      setProgress(event);
+      if (event.event === 'done') socket.disconnect();
+    });
+    return () => socket.disconnect();
+  }, [auditId]);
+  return progress;
+}
+
+8.4 Key Visualisation Components
+Component	Library	Data Input	Description
+BiasHeatmap	D3.js	by_group metric values	Grid of protected-attr × metric cells, colour-scaled from green (pass) to red (fail)
+ShapBeeswarm	D3.js	shap_summary.beeswarm_data	SHAP beeswarm plot with group overlay; hover shows individual point details
+DisparityBarChart	Recharts	fairness_metrics[]	Grouped bar chart comparing approval rates per demographic group
+DriftTimeline	Recharts	monitor_snapshots[]	Multi-line chart of fairness metrics over time; alert threshold shown as dashed line
+RiskGauge	Custom SVG	risk_score (0–100)	Semicircular gauge coloured LOW/MED/HIGH/CRITICAL; animates on load
+CounterfactualTable	shadcn Table	counterfactuals[]	Shows original vs flipped attribute value, score delta, and decision change indicator
+ 
+09
+SECURITY & PRIVACY REQUIREMENTS
+Security & Privacy Requirements
+
+9.1 Authentication & Authorisation
+Control	Implementation
+Auth Scheme	JWT Bearer tokens. Access token TTL: 15 minutes. Refresh token TTL: 7 days, HTTP-only cookie.
+Password Storage	bcrypt hash, cost factor 12. Minimum 8 chars, 1 upper, 1 number required.
+Role-Based Access	Roles: admin, analyst, viewer. Analysts can create audits; viewers are read-only; admins manage org settings.
+Token Rotation	Refresh token is single-use; rotated on every use. Old refresh tokens invalidated on reuse (stolen token detection).
+Rate Limiting	100 audit jobs/hour/org. 1000 API requests/hour/user. Enforced at Nginx layer and FastAPI middleware.
+CORS	Strict origin allowlist. Credentials allowed only for own domain. No wildcard origins.
+
+9.2 Data Security
+Control	Implementation
+Transport Encryption	TLS 1.3 enforced. HSTS header with max-age=31536000. Certificate pinning on mobile (future).
+Data at Rest	PostgreSQL AES-256 transparent encryption (pgcrypto). S3 bucket encryption with KMS-managed keys.
+Uploaded File Handling	Files stored with UUID filename (no original filename persisted). Virus scan via ClamAV on upload. Deleted after 24h via scheduled job.
+Database Access	SQLAlchemy connection pool. Parameterised queries only (no string interpolation). Row-level security enforced via org_id foreign key.
+Secrets Management	All credentials stored in environment variables. Never committed to VCS. Production uses Railway/Render secret store.
+Audit Logging	All data access events logged to append-only audit_log table with user_id, action, resource_id, IP, timestamp.
+
+9.3 Privacy Requirements
+•	GDPR Article 25 (Privacy by Design): Uploaded datasets are never used for model training, never shared, and auto-deleted.
+•	Data Minimisation: Only the columns necessary for the audit are processed; raw rows are never stored in PostgreSQL.
+•	Right to Erasure: DELETE /audits/{id} removes all records, SHAP blobs, LLM outputs, and generated PDFs within 30 seconds.
+•	Anonymisation: If auto-detection flags a column as a direct identifier (name, email, SSN pattern), PradnyaChakshu  masks it before processing.
+•	Data Residency: Configurable per-org; EU orgs can be restricted to EU-hosted infrastructure.
+
+9.4 LLM Security
+•	No raw PII is included in Claude API prompts. Only aggregated statistics and column names are sent.
+•	Prompt injection prevention: org_context field is HTML-escaped and truncated to 500 chars before inclusion in prompt.
+•	Anthropic API key is stored in environment variable; never logged or returned to the client.
+•	LLM responses are JSON-parsed and schema-validated before being stored; arbitrary text injection is rejected.
+ 
+10
+INFRASTRUCTURE & DEPLOYMENT
+Infrastructure & Deployment
+
+10.1 Docker Compose (Development)
+# docker-compose.yml (abridged)
+services:
+  api:
+    build: ./backend
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      DATABASE_URL: postgresql://PradnyaChakshu :pass@db:5432/PradnyaChakshu 
+      REDIS_URL: redis://redis:6379/0
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+    depends_on: [db, redis]
+  worker:
+    build: ./backend
+    command: celery -A tasks worker --loglevel=info --concurrency=4
+    environment: *api-env
+    depends_on: [db, redis]
+  frontend:
+    build: ./frontend
+    command: npm run dev -- --host
+    ports: ['5173:5173']
+  db:
+    image: postgres:16-alpine
+    volumes: ['pgdata:/var/lib/postgresql/data']
+  redis:
+    image: redis:7-alpine
+    volumes: ['redisdata:/data']
+
+10.2 Production Deployment (Railway)
+Service	Railway Config	Resources
+API (FastAPI)	Dockerfile deploy, auto-scale 1–3 replicas	512MB RAM, 0.5 vCPU
+Worker (Celery)	Dockerfile deploy, 2 workers	1GB RAM, 1 vCPU (SHAP is memory intensive)
+Database	Railway Postgres plugin	1GB RAM, 10GB storage
+Redis	Railway Redis plugin	256MB RAM
+Frontend	Static build deploy to Vercel CDN	Global CDN, auto-HTTPS
+
+10.3 CI/CD Pipeline (GitHub Actions)
+# .github/workflows/deploy.yml (abridged)
+on: [push to main]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run backend tests
+        run: cd backend && pytest --cov=. --cov-report=xml
+      - name: Run frontend tests
+        run: cd frontend && npm run test
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+  deploy:
+    needs: test
+    steps:
+      - name: Deploy API to Railway
+        run: railway up --service api
+      - name: Deploy frontend to Vercel
+        run: vercel --prod
+      - name: Run smoke tests
+        run: ./scripts/smoke_test.sh $PROD_URL
+
+10.4 Environment Variables
+Variable	Required	Description
+ANTHROPIC_API_KEY	YES	Claude API key. Never commit to VCS.
+DATABASE_URL	YES	PostgreSQL connection string
+REDIS_URL	YES	Redis connection string
+JWT_SECRET_KEY	YES	HS256 signing secret, min 32 chars. Rotate every 90 days.
+JWT_ALGORITHM	NO	Default: HS256
+CORS_ORIGINS	YES	Comma-separated list of allowed frontend origins
+MAX_UPLOAD_MB	NO	Default: 50
+FILE_TTL_HOURS	NO	Default: 24. Time before uploaded files are deleted.
+CELERY_CONCURRENCY	NO	Default: 4 workers
+SENTRY_DSN	NO	Sentry error tracking DSN (production only)
+LOG_LEVEL	NO	Default: INFO. Use DEBUG for development.
+ENVIRONMENT	NO	'development' | 'staging' | 'production'
+ 
+11
+PERFORMANCE REQUIREMENTS
+Performance Requirements
+
+Operation	Target P50	Target P95	Hard Limit	Notes
+CSV upload (10MB)	< 2s	< 5s	30s	Client-side parsing reduces upload payload
+Attribute detection	< 1s	< 3s	10s	Stage 3 (embedding) is most expensive
+Fairness metrics (10k rows)	< 8s	< 15s	60s	All 12 metrics in parallel via Celery chord
+SHAP computation (10k rows)	< 20s	< 45s	120s	KernelExplainer is slowest; TreeExplainer < 5s
+LLM explanation (Claude)	< 8s	< 20s	45s	Async; does not block metrics render
+PDF report generation	< 3s	< 8s	30s	ReportLab; triggered after LLM completes
+Total audit (10k rows, tree model)	< 35s	< 75s	180s	Full end-to-end wall-clock time
+Dashboard page load	< 1.2s	< 2.5s	5s	SSR not required; CDN-cached static assets
+API response (non-analysis)	< 100ms	< 300ms	1s	Auth, list, metadata endpoints
+
+11.1 Scaling Strategy
+•	Celery workers scaled horizontally to handle concurrent audit jobs. Each worker handles one job at a time.
+•	SHAP computation is the bottleneck for large datasets. For datasets > 50k rows, PradnyaChakshu  samples 10k rows for SHAP (full dataset used for metrics).
+•	Redis cluster mode enabled for production deployments serving > 50 concurrent organisations.
+•	Database read replicas used for dashboard list queries; writes always go to primary.
+ 
+12
+TESTING STRATEGY
+Testing Strategy
+
+12.1 Test Pyramid
+Layer	Framework	Coverage Target	What Is Tested
+Unit Tests	pytest	85% line coverage	Individual metric functions, SHAP module, counterfactual generator, prompt builder, risk scorer
+Integration Tests	pytest + TestClient	70% endpoint coverage	Full API endpoints with real PostgreSQL (testcontainers), mocked Celery, mocked Claude API
+Component Tests	vitest + Testing Library	80% component coverage	React components with mocked API responses; chart rendering; WebSocket hook
+End-to-End Tests	Playwright	Core user journeys	Upload CSV → audit complete → download report; Monitor creation; Auth flow
+Performance Tests	k6	Load profile validation	50 concurrent audit uploads; API response time under load
+Fairness Validation Tests	pytest	100% metric coverage	Known-biased synthetic datasets with pre-computed expected metric values
+
+12.2 Fairness Validation Datasets
+PradnyaChakshu  ships with four synthetic validation datasets that have pre-computed ground truth metric values for regression testing:
+
+Dataset	Rows	Bias Type	Expected Failing Metrics
+hiring_gender_bias.csv	5,000	Hiring model rejecting women at 2.5x rate	Demographic Parity, Equalized Odds, Disparate Impact
+lending_race_bias.csv	10,000	Loan denial rate 3x higher for Black applicants	Demographic Parity, Predictive Parity, Disparate Impact
+healthcare_age_bias.csv	8,000	Diagnostic AI missing cases in 65+ age group	Equal Opportunity, Equalized Odds
+fair_baseline.csv	5,000	Deliberately balanced — all metrics should pass	None (regression: zero false positives)
+
+12.3 Key Unit Test Cases
+# tests/test_metrics.py
+def test_demographic_parity_known_bias():
+    """Dataset where Group A approval=0.8, Group B approval=0.4"""
+    result = compute_demographic_parity(y_pred, sensitive_features)
+    assert abs(result.overall_value - 0.4) < 0.001
+    assert result.pass_fail == 'FAIL'
+    assert result.disparity_ratio == pytest.approx(0.5, abs=0.01)
+ 
+def test_disparate_impact_4_5_rule():
+    """Ratio=0.78 should FAIL (below 0.80 threshold)"""
+    result = compute_disparate_impact(y_pred, sensitive_features)
+    assert result.overall_value == pytest.approx(0.78, abs=0.01)
+    assert result.pass_fail == 'FAIL'
+ 
+def test_risk_score_critical():
+    """High violations across 3+ metrics should yield CRITICAL"""
+    score, level = compute_risk_score(high_violation_metrics)
+    assert score > 70
+    assert level == 'CRITICAL'
+ 
+def test_llm_response_fallback_on_invalid_json(mock_anthropic):
+    mock_anthropic.messages.create.return_value.content[0].text = 'INVALID'
+    result = call_llm_explainer(sample_audit_result)
+    assert result['_error'] == 'llm_parse_failure'
+    assert result['executive_summary'] != ''
+ 
+13
+ERROR HANDLING & LOGGING
+Error Handling & Logging
+
+13.1 Backend Error Handling Strategy
+All unhandled exceptions in FastAPI are caught by a global exception handler that returns a structured error envelope and reports to Sentry with full context. Celery tasks use max_retries=3 with exponential backoff; after exhausting retries, the audit status is set to 'failed' and an error_message is stored.
+
+# main.py — global exception handler
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    trace_id = sentry_sdk.capture_exception(exc)
+    logger.error('Unhandled exception', extra={
+        'trace_id': trace_id,
+        'path': request.url.path,
+        'method': request.method,
+    })
+    return JSONResponse(status_code=500, content={
+        'error': {
+            'code': 'INTERNAL_ERROR',
+            'message': 'An unexpected error occurred.',
+            'trace_id': str(trace_id),
+        }
+    })
+
+13.2 Structured Logging Schema
+All log entries are emitted as structured JSON (python-json-logger) to stdout. Collected by Railway/Render log aggregation or a self-hosted Loki stack in production.
+
+{
+  "timestamp":   "2026-03-15T10:22:01.443Z",
+  "level":        "INFO",
+  "service":      "PradnyaChakshu -api",
+  "environment":  "production",
+  "trace_id":     "abc-123",
+  "user_id":      "uuid...",
+  "org_id":       "uuid...",
+  "audit_id":     "uuid...",
+  "event":        "audit.metrics.completed",
+  "duration_ms":  7423,
+  "metrics_count": 12,
+  "risk_score":   67.4
+}
+
+13.3 Celery Task Error Handling
+# tasks/fairness_tasks.py
+@celery_app.task(
+    bind=True,
+    max_retries=3,
+    default_retry_delay=2,  # seconds; doubles on each retry
+    autoretry_for=(TransientError,),
+    reject_on_worker_lost=True,
+)
+def compute_fairness_metrics(self, audit_id: str, file_path: str):
+    try:
+        # ... metric computation ...
+        emit_ws_progress(audit_id, stage='metrics', pct=60)
+    except PermanentError as e:
+        # Non-retryable: mark audit failed immediately
+        update_audit_status(audit_id, 'failed', str(e))
+        raise
+    except TransientError as e:
+        # Retryable: Celery will retry automatically
+        logger.warning(f'Transient error, retrying: {e}')
+        raise self.retry(exc=e, countdown=2 ** self.request.retries)
+ 
+14
+CONFIGURATION & ENVIRONMENT
+Configuration & Environment
+
+14.1 Pydantic Settings
+# config.py
+from pydantic_settings import BaseSettings
+ 
+class Settings(BaseSettings):
+    # Core
+    environment:          str  = 'development'
+    log_level:            str  = 'INFO'
+    # Database
+    database_url:         str
+    db_pool_size:         int  = 10
+    db_max_overflow:      int  = 20
+    # Redis / Celery
+    redis_url:            str
+    celery_concurrency:   int  = 4
+    # Auth
+    jwt_secret_key:       str
+    jwt_algorithm:        str  = 'HS256'
+    access_token_ttl_min: int  = 15
+    refresh_token_ttl_days: int = 7
+    # LLM
+    anthropic_api_key:    str
+    llm_model:            str  = 'claude-sonnet-4-20250514'
+    llm_max_tokens:       int  = 2048
+    llm_temperature:      float = 0.2
+    # File handling
+    max_upload_mb:        int  = 50
+    file_ttl_hours:       int  = 24
+    upload_dir:           str  = '/tmp/PradnyaChakshu '
+    # CORS
+    cors_origins:         list[str] = ['http://localhost:5173']
+ 
+    class Config:
+        env_file = '.env'
+        case_sensitive = False
+ 
+settings = Settings()
+
+14.2 Fairness Metric Thresholds (configurable per regulation)
+Regulation	DPD Threshold	EOD Threshold	DIR Threshold	CalD Threshold
+generic	≤ 0.10	≤ 0.10	≥ 0.80	≤ 0.05
+eu_ai_act	≤ 0.05	≤ 0.05	≥ 0.90	≤ 0.03
+eeoc	≤ 0.10	≤ 0.10	≥ 0.80	≤ 0.05
+cfpb	≤ 0.08	≤ 0.10	≥ 0.80	≤ 0.05
+DPD = Demographic Parity Difference. EOD = Equalized Odds Difference. DIR = Disparate Impact Ratio. CalD = Calibration Difference.
+
+
+
+End of Technical Requirements Document
+PradnyaChakshu  TRD v1.0 — All specifications subject to revision. Questions: engineering@PradnyaChakshu .io
